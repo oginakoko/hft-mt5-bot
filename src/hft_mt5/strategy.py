@@ -42,35 +42,35 @@ class HFTStrategy:
             
             # Initialize components with MT5Handler
             self.feature_generator = FeatureGenerator(
-                window_size=self.config.getint('HFT', 'tick_features_window', fallback=20)
+                window_size=2  # Ultra-short window for instant reactions
             )
             self.logger.info("FeatureGenerator initialized")
             
             self.signal_generator = SignalGenerator(
-                threshold=self.config.getfloat('HFT', 'signal_threshold', fallback=0.7)
+                threshold=0.03  # Extremely aggressive threshold
             )
             self.logger.info("SignalGenerator initialized")
             
             self.risk_manager = RiskManager(
                 self.mt5_handler,
-                max_risk_per_trade=self.config.getfloat('Risk', 'max_risk_per_trade', fallback=0.02),
-                max_total_risk=self.config.getfloat('Risk', 'max_total_risk', fallback=0.06),
-                max_positions=self.config.getint('Risk', 'max_positions', fallback=3),
-                max_drawdown=self.config.getfloat('Risk', 'max_drawdown', fallback=0.1)
+                max_risk_per_trade=0.005,  # 0.5% risk per trade - very aggressive
+                max_total_risk=0.05,  # 5% total risk - tighter overall risk
+                max_positions=3,  # Very few concurrent positions
+                max_drawdown=0.04  # 4% max drawdown - strict control
             )
             self.logger.info("RiskManager initialized")
             
             self.execution_engine = ExecutionEngine(
-                self.mt5_handler,
-                use_market_orders=self.config.getboolean('Trading', 'use_market_orders', fallback=True)
+                self.mt5_handler
             )
             self.logger.info("ExecutionEngine initialized")
             
-            self.symbols = self.config.get('Trading', 'symbols').split(',')
+            # Get all available symbols and filter for most liquid ones
+            self.symbols = self._get_liquid_symbols()
             self.logger.info(f"Trading symbols: {self.symbols}")
             
             self.tick_buffers = {symbol: TickBuffer(
-                max_size=self.config.getint('HFT', 'tick_buffer_size', fallback=1000)
+                max_size=15  # Tiny buffer for instant processing
             ) for symbol in self.symbols}
             self.logger.info("Tick buffers initialized")
             
@@ -95,6 +95,35 @@ class HFTStrategy:
             self.logger.error(f"Error during strategy initialization: {e}")
             self._initialized = False
             raise
+            
+    def _get_liquid_symbols(self) -> List[str]:
+        """Get list of liquid symbols to trade."""
+        try:
+            all_symbols = self.mt5_handler.get_symbols()
+            if not all_symbols or "error" in all_symbols:
+                return ['EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF', 'AUDUSD']
+                
+            liquid_symbols = []
+            for symbol in all_symbols:
+                info = self.mt5_handler.get_symbol_info(symbol)
+                if not info or "error" in info:
+                    continue
+                    
+                # More aggressive filtering for ultra-liquid pairs
+                if (info.get('spread', 1000) < 10 and  # Tighter spread requirement
+                    info.get('trade_mode', 0) == 4 and
+                    len(symbol) == 6 and
+                    any(curr in symbol for curr in ['USD', 'EUR', 'GBP', 'JPY', 'CHF', 'AUD', 'NZD', 'CAD'])):
+                    liquid_symbols.append(symbol)
+                    
+            if not liquid_symbols:
+                return ['EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF', 'AUDUSD']
+                
+            return liquid_symbols[:30]  # Trade more pairs simultaneously
+            
+        except Exception as e:
+            self.logger.error(f"Error getting liquid symbols: {e}")
+            return ['EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF', 'AUDUSD']
             
     def start(self) -> bool:
         """Start the trading strategy."""
@@ -206,98 +235,60 @@ class HFTStrategy:
                 time.sleep(1)  # Update every second
                 
     def _process_symbol(self, symbol: str):
-        """Process market data for a symbol."""
-        last_tick_time = 0
-        min_tick_interval = 0.001  # 1ms minimum between ticks
-        
-        while not self.stop_event.is_set():
-            try:
-                current_time = time.time()
-                if current_time - last_tick_time < min_tick_interval:
-                    continue
-                    
-                # Get latest tick
-                tick_info = self.mt5_handler.get_symbol_info(symbol)
-                if not tick_info or "error" in tick_info:
-                    continue
-                    
-                tick = Tick(
-                    bid=tick_info['bid'],
-                    ask=tick_info['ask'],
-                    time=current_time,
-                    volume=tick_info.get('volume', 0)
-                )
-                
-                # Update tick buffer
-                self.tick_buffers[symbol].add_tick(tick)
-                
-                # Generate features
-                features = self.feature_generator.calculate_features(
-                    self.tick_buffers[symbol]
-                )
-                
-                # Generate signals
-                signal = self.signal_generator.generate_signal(
-                    symbol=symbol,
-                    features=features,
-                    timestamp=int(current_time * 1000)  # Millisecond timestamp
-                )
-                
-                if signal and signal.direction != 0:
-                    self._execute_signal(signal)
-                    
-                last_tick_time = current_time
-                    
-            except Exception as e:
-                self.logger.error(f"Error processing {symbol}: {e}")
-            finally:
-                time.sleep(0.0001)  # 0.1ms delay to prevent CPU overload
-                
-    def _execute_signal(self, signal: Signal):
-        """Execute a trading signal."""
+        """Process updates for a single symbol."""
         try:
-            # Quick position check
-            if not self.risk_manager.can_open_position(signal.symbol):
+            # Get latest tick
+            mt5_tick = self.mt5_handler.get_last_tick(symbol)
+            if not mt5_tick or "error" in mt5_tick:
                 return
                 
-            # Calculate position size based on signal strength
-            position_size = self.risk_manager.calculate_position_size(
-                signal.symbol,
-                signal.strength
+            # Convert MT5 tick dict to Tick object
+            tick = Tick(
+                bid=mt5_tick['bid'],
+                ask=mt5_tick['ask'],
+                time=mt5_tick.get('time_msc', time.time() * 1000) / 1000.0,
+                volume=mt5_tick.get('volume', 0.0)
             )
+                
+            # Add tick to buffer
+            self.tick_buffers[symbol].add_tick(tick)
             
-            if position_size <= 0:
+            # Check virtual SL/TP for existing positions
+            self.execution_engine.check_positions()
+            
+            # Generate features from recent ticks
+            recent_ticks = self.tick_buffers[symbol].get_recent(25)  # Minimal ticks required
+            if len(recent_ticks) < 10:  # Ultra-fast entry with just 10 ticks
                 return
                 
-            # Get current market state
-            symbol_info = self.mt5_handler.get_symbol_info(signal.symbol)
-            if not symbol_info or "error" in symbol_info:
+            features = self.feature_generator.generate_features(recent_ticks)
+            
+            # Generate trading signal
+            signal = self.signal_generator.generate_signal(features)
+            if not signal or abs(signal.strength) < 0.08:  # Very low signal requirement
                 return
                 
-            # Dynamic stop loss and take profit based on volatility
-            volatility = signal.features.get('volatility', 0.0001)
-            stop_loss_pips = max(5, min(20, int(volatility * 10000)))
-            take_profit_pips = max(7, min(30, int(volatility * 15000)))
+            # Calculate position size
+            risk_amount = self.risk_manager.get_position_size(symbol, signal.direction)
+            if not risk_amount:
+                return
+                
+            # Calculate dynamic SL/TP based on signal strength
+            sl_points = int(20 + signal.strength * 30)  # Tighter range: 20-50 points
+            tp_points = int(30 + signal.strength * 45)  # Tighter range: 30-75 points
             
-            # Execute trade with tight stops
-            result = self.execution_engine.execute_signal(
-                signal,
-                position_size,
-                stop_loss_pips,
-                take_profit_pips
+            # Execute the trade
+            self.execution_engine.execute_signal(
+                symbol=symbol,
+                direction=signal.direction,
+                volume=risk_amount,
+                sl_points=sl_points,
+                tp_points=tp_points
             )
-            
-            # Log the trade execution
-            if result and "error" not in result:
-                self.logger.info(
-                    f"Executed {signal.direction > 0 and 'BUY' or 'SELL'} signal on {signal.symbol} "
-                    f"with size {position_size:.2f} @ {result.get('price', 0):.5f} "
-                    f"(SL: {stop_loss_pips}p, TP: {take_profit_pips}p)"
-                )
             
         except Exception as e:
-            self.logger.error(f"Error executing signal: {e}")
-            
+            self.logger.error(f"Error processing symbol {symbol}: {str(e)}")
+                
     def add_symbol(self, symbol: str) -> bool:
         """Add a new trading symbol."""
         with self._lock:
