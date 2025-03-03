@@ -207,8 +207,15 @@ class HFTStrategy:
                 
     def _process_symbol(self, symbol: str):
         """Process market data for a symbol."""
+        last_tick_time = 0
+        min_tick_interval = 0.001  # 1ms minimum between ticks
+        
         while not self.stop_event.is_set():
             try:
+                current_time = time.time()
+                if current_time - last_tick_time < min_tick_interval:
+                    continue
+                    
                 # Get latest tick
                 tick_info = self.mt5_handler.get_symbol_info(symbol)
                 if not tick_info or "error" in tick_info:
@@ -217,7 +224,7 @@ class HFTStrategy:
                 tick = Tick(
                     bid=tick_info['bid'],
                     ask=tick_info['ask'],
-                    time=time.time(),
+                    time=current_time,
                     volume=tick_info.get('volume', 0)
                 )
                 
@@ -233,43 +240,61 @@ class HFTStrategy:
                 signal = self.signal_generator.generate_signal(
                     symbol=symbol,
                     features=features,
-                    timestamp=int(time.time())
+                    timestamp=int(current_time * 1000)  # Millisecond timestamp
                 )
                 
-                if signal and signal.direction != 0 and signal.strength > self.signal_generator.threshold:
+                if signal and signal.direction != 0:
                     self._execute_signal(signal)
+                    
+                last_tick_time = current_time
                     
             except Exception as e:
                 self.logger.error(f"Error processing {symbol}: {e}")
             finally:
-                time.sleep(0.001)  # Small delay to prevent CPU overload
+                time.sleep(0.0001)  # 0.1ms delay to prevent CPU overload
                 
-    def _execute_signal(self, signal):
+    def _execute_signal(self, signal: Signal):
         """Execute a trading signal."""
         try:
+            # Quick position check
             if not self.risk_manager.can_open_position(signal.symbol):
                 return
                 
+            # Calculate position size based on signal strength
             position_size = self.risk_manager.calculate_position_size(
                 signal.symbol,
                 signal.strength
             )
             
-            if position_size > 0:
-                result = self.execution_engine.execute_signal(
-                    signal,
-                    position_size,
-                    self.risk_manager.stop_loss_pips,
-                    self.risk_manager.take_profit_pips
+            if position_size <= 0:
+                return
+                
+            # Get current market state
+            symbol_info = self.mt5_handler.get_symbol_info(signal.symbol)
+            if not symbol_info or "error" in symbol_info:
+                return
+                
+            # Dynamic stop loss and take profit based on volatility
+            volatility = signal.features.get('volatility', 0.0001)
+            stop_loss_pips = max(5, min(20, int(volatility * 10000)))
+            take_profit_pips = max(7, min(30, int(volatility * 15000)))
+            
+            # Execute trade with tight stops
+            result = self.execution_engine.execute_signal(
+                signal,
+                position_size,
+                stop_loss_pips,
+                take_profit_pips
+            )
+            
+            # Log the trade execution
+            if result and "error" not in result:
+                self.logger.info(
+                    f"Executed {signal.direction > 0 and 'BUY' or 'SELL'} signal on {signal.symbol} "
+                    f"with size {position_size:.2f} @ {result.get('price', 0):.5f} "
+                    f"(SL: {stop_loss_pips}p, TP: {take_profit_pips}p)"
                 )
-                
-                # Log the trade execution
-                if result and "error" not in result:
-                    self.logger.info(
-                        f"Executed {signal.direction > 0 and 'BUY' or 'SELL'} signal on {signal.symbol} "
-                        f"with size {position_size:.2f} @ {result.get('price', 0):.5f}"
-                    )
-                
+            
         except Exception as e:
             self.logger.error(f"Error executing signal: {e}")
             
