@@ -1,0 +1,814 @@
+# HFT Strategy Framework for MetaTrader 5 using Python
+# Framework designed for speed, efficiency, and easy debugging
+
+# ===============================================================
+# 1. IMPORTS AND CONFIGURATION
+# ===============================================================
+
+import MetaTrader5 as mt5
+import pandas as pd
+import numpy as np
+import time
+import logging
+import threading
+import queue
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional, Union, Callable
+import configparser
+import pickle
+import os
+from datetime import datetime, timedelta
+
+
+# ===============================================================
+# 2. LOGGING AND MONITORING SETUP
+# ===============================================================
+
+class LoggerSetup:
+    @staticmethod
+    def setup():
+        """Configure logging with appropriate levels and handlers"""
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler("hft_strategy.log"),
+                logging.StreamHandler()
+            ]
+        )
+        return logging.getLogger('HFT_Strategy')
+
+logger = LoggerSetup.setup()
+
+
+# ===============================================================
+# 3. CONFIGURATION MANAGEMENT
+# ===============================================================
+
+class Config:
+    """Centralized configuration management"""
+    
+    def __init__(self, config_file="config.ini"):
+        self.config = configparser.ConfigParser()
+        self.config_file = config_file
+        if os.path.exists(config_file):
+            self.config.read(config_file)
+        else:
+            self._create_default_config()
+    
+    def _create_default_config(self):
+        """Create default configuration if none exists"""
+        self.config['MT5'] = {
+            'username': '',
+            'password': '',
+            'server': '',
+            'path': 'C:\\Program Files\\MetaTrader 5\\terminal64.exe',
+        }
+        
+        self.config['Trading'] = {
+            'symbols': 'USDJPY,EURUSD,GBPUSD',
+            'max_positions': '5',
+            'max_drawdown': '0.2',  # 20% max drawdown
+            'risk_per_trade': '0.01',  # 1% risk per trade
+            'use_market_orders': 'True',
+            'stop_loss_pips': '10',
+            'take_profit_pips': '20',
+        }
+        
+        self.config['HFT'] = {
+            'tick_buffer_size': '1000',
+            'signal_threshold': '0.7',
+            'tick_features_window': '20',
+            'polling_interval_ms': '50',
+            'trade_cooldown_ms': '500',
+        }
+        
+        with open(self.config_file, 'w') as f:
+            self.config.write(f)
+    
+    def get(self, section, key, fallback=None):
+        return self.config.get(section, key, fallback=fallback)
+    
+    def getint(self, section, key, fallback=None):
+        return self.config.getint(section, key, fallback=fallback)
+    
+    def getfloat(self, section, key, fallback=None):
+        return self.config.getfloat(section, key, fallback=fallback)
+    
+    def getboolean(self, section, key, fallback=None):
+        return self.config.getboolean(section, key, fallback=fallback)
+    
+    def save(self):
+        with open(self.config_file, 'w') as f:
+            self.config.write(f)
+
+
+# ===============================================================
+# 4. DATA STRUCTURES
+# ===============================================================
+
+@dataclass
+class Tick:
+    """Tick data structure"""
+    symbol: str
+    time: int  # Unix timestamp in milliseconds
+    bid: float
+    ask: float
+    last: float
+    volume: float
+    flags: int
+
+
+@dataclass
+class Position:
+    """Trading position information"""
+    ticket: int
+    symbol: str
+    type: int  # 0 for buy, 1 for sell
+    volume: float
+    open_price: float
+    open_time: int
+    stop_loss: float
+    take_profit: float
+    profit: float
+
+
+@dataclass
+class Signal:
+    """Trading signal information"""
+    symbol: str
+    direction: int  # 1 for buy, -1 for sell, 0 for neutral
+    strength: float  # 0.0 to 1.0
+    timestamp: int
+    features: Dict[str, float]  # Features that generated this signal
+
+
+class TickBuffer:
+    """Efficient circular buffer for storing recent ticks"""
+    
+    def __init__(self, symbol: str, max_size: int = 1000):
+        self.symbol = symbol
+        self.max_size = max_size
+        self.buffer = np.zeros(max_size, dtype=[
+            ('time', 'i8'),
+            ('bid', 'f8'),
+            ('ask', 'f8'),
+            ('last', 'f8'),
+            ('volume', 'f8'),
+            ('spread', 'f8'),
+            ('mid', 'f8')
+        ])
+        self.current_idx = 0
+        self.is_filled = False
+        self.lock = threading.Lock()
+    
+    def add_tick(self, tick: Tick):
+        """Add a new tick to the buffer"""
+        with self.lock:
+            self.buffer[self.current_idx]['time'] = tick.time
+            self.buffer[self.current_idx]['bid'] = tick.bid
+            self.buffer[self.current_idx]['ask'] = tick.ask
+            self.buffer[self.current_idx]['last'] = tick.last
+            self.buffer[self.current_idx]['volume'] = tick.volume
+            self.buffer[self.current_idx]['spread'] = tick.ask - tick.bid
+            self.buffer[self.current_idx]['mid'] = (tick.bid + tick.ask) / 2
+            
+            self.current_idx = (self.current_idx + 1) % self.max_size
+            if self.current_idx == 0:
+                self.is_filled = True
+    
+    def get_recent_ticks(self, n: int = None) -> np.ndarray:
+        """Get the n most recent ticks (or all if buffer is not filled yet)"""
+        with self.lock:
+            if n is None:
+                n = self.max_size
+            
+            if self.is_filled:
+                if n >= self.max_size:
+                    return self.buffer.copy()
+                else:
+                    idx = (self.current_idx - n) % self.max_size
+                    if idx < self.current_idx:
+                        return self.buffer[idx:self.current_idx].copy()
+                    else:
+                        return np.concatenate((self.buffer[idx:], self.buffer[:self.current_idx]))
+            else:
+                return self.buffer[:self.current_idx].copy()
+    
+    def to_dataframe(self, n: int = None) -> pd.DataFrame:
+        """Convert recent ticks to a DataFrame for analysis"""
+        recent_ticks = self.get_recent_ticks(n)
+        return pd.DataFrame(recent_ticks)
+
+
+# ===============================================================
+# 5. MT5 CONNECTION AND DATA ACQUISITION
+# ===============================================================
+
+class MT5Handler:
+    """Handles connection and interaction with MetaTrader 5"""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.connected = False
+        self.logger = logging.getLogger('HFT_Strategy.MT5Handler')
+        self.tick_callbacks = []
+    
+    def connect(self) -> bool:
+        """Initialize connection to MT5 terminal"""
+        try:
+            # Initialize MT5
+            if not mt5.initialize(
+                path=self.config.get('MT5', 'path'),
+                login=self.config.getint('MT5', 'username', 0),
+                password=self.config.get('MT5', 'password', ''),
+                server=self.config.get('MT5', 'server', '')
+            ):
+                error = mt5.last_error()
+                self.logger.error(f"Failed to initialize MT5: {error}")
+                return False
+            
+            self.connected = True
+            self.logger.info(f"Connected to MT5: {mt5.terminal_info()}")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Error connecting to MT5: {e}")
+            return False
+    
+    def disconnect(self):
+        """Shutdown MT5 connection"""
+        if self.connected:
+            mt5.shutdown()
+            self.connected = False
+            self.logger.info("Disconnected from MT5")
+    
+    def get_symbols(self) -> List[str]:
+        """Get available symbols from MT5"""
+        if not self.connected:
+            self.logger.error("Not connected to MT5")
+            return []
+        
+        symbols = mt5.symbols_get()
+        return [symbol.name for symbol in symbols]
+    
+    def get_account_info(self) -> Dict:
+        """Get account information"""
+        if not self.connected:
+            self.logger.error("Not connected to MT5")
+            return {}
+        
+        account_info = mt5.account_info()
+        if account_info is None:
+            return {}
+        
+        return {
+            'balance': account_info.balance,
+            'equity': account_info.equity,
+            'margin': account_info.margin,
+            'free_margin': account_info.margin_free,
+            'profit': account_info.profit,
+            'leverage': account_info.leverage
+        }
+    
+    def get_tick(self, symbol: str) -> Optional[Tick]:
+        """Get current tick for a symbol"""
+        if not self.connected:
+            self.logger.error("Not connected to MT5")
+            return None
+        
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            return None
+        
+        return Tick(
+            symbol=symbol,
+            time=tick.time_msc,
+            bid=tick.bid,
+            ask=tick.ask,
+            last=tick.last,
+            volume=tick.volume,
+            flags=tick.flags
+        )
+    
+    def get_recent_ticks(self, symbol: str, count: int = 1000) -> List[Tick]:
+        """Get most recent ticks for a symbol"""
+        if not self.connected:
+            self.logger.error("Not connected to MT5")
+            return []
+        
+        current_tick = mt5.symbol_info_tick(symbol)
+        if current_tick is None:
+            return []
+        
+        ticks = mt5.copy_ticks_from(symbol, current_tick.time, count, mt5.COPY_TICKS_ALL)
+        if ticks is None:
+            return []
+        
+        return [
+            Tick(
+                symbol=symbol,
+                time=tick[0],
+                bid=tick[1],
+                ask=tick[2],
+                last=tick[3],
+                volume=tick[4],
+                flags=tick[5]
+            )
+            for tick in ticks
+        ]
+    
+    def get_positions(self) -> List[Position]:
+        """Get current open positions"""
+        if not self.connected:
+            self.logger.error("Not connected to MT5")
+            return []
+        
+        positions = mt5.positions_get()
+        if positions is None:
+            return []
+        
+        return [
+            Position(
+                ticket=position.ticket,
+                symbol=position.symbol,
+                type=position.type,
+                volume=position.volume,
+                open_price=position.price_open,
+                open_time=position.time,
+                stop_loss=position.sl,
+                take_profit=position.tp,
+                profit=position.profit
+            )
+            for position in positions
+        ]
+    
+    def place_market_order(self, symbol: str, order_type: int, volume: float, 
+                           stop_loss: float = 0.0, take_profit: float = 0.0, 
+                           comment: str = "") -> Optional[int]:
+        """Place a market order"""
+        if not self.connected:
+            self.logger.error("Not connected to MT5")
+            return None
+        
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "volume": volume,
+            "type": order_type,
+            "price": mt5.symbol_info_tick(symbol).ask if order_type == mt5.ORDER_TYPE_BUY else mt5.symbol_info_tick(symbol).bid,
+            "sl": stop_loss,
+            "tp": take_profit,
+            "deviation": 10,  # Maximum price deviation in points
+            "magic": 123456,  # Magic number for identification
+            "comment": comment,
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+        
+        result = mt5.order_send(request)
+        if result.retcode != mt5.TRADE_RETCODE_DONE:
+            self.logger.error(f"Order placement failed: {result.retcode}, {result.comment}")
+            return None
+        
+        self.logger.info(f"Order placed successfully: ticket={result.order}")
+        return result.order
+    
+    def close_position(self, position_ticket: int) -> bool:
+        """Close an open position by ticket"""
+        if not self.connected:
+            self.logger.error("Not connected to MT5")
+            return False
+        
+        positions = mt5.positions_get(ticket=position_ticket)
+        if positions is None or len(positions) == 0:
+            self.logger.error(f"Position {position_ticket} not found")
+            return False
+        
+        position = positions[0]
+        
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": position.symbol,
+            "volume": position.volume,
+            "type": mt5.ORDER_TYPE_SELL if position.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY,
+            "position": position_ticket,
+            "price": mt5.symbol_info_tick(position.symbol).bid if position.type == mt5.ORDER_TYPE_BUY else mt5.symbol_info_tick(position.symbol).ask,
+            "deviation": 10,
+            "magic": 123456,
+            "comment": "Close position",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+        
+        result = mt5.order_send(request)
+        if result.retcode != mt5.TRADE_RETCODE_DONE:
+            self.logger.error(f"Position close failed: {result.retcode}, {result.comment}")
+            return False
+        
+        self.logger.info(f"Position {position_ticket} closed successfully")
+        return True
+    
+    def close_all_positions(self) -> bool:
+        """Close all open positions"""
+        if not self.connected:
+            self.logger.error("Not connected to MT5")
+            return False
+        
+        positions = mt5.positions_get()
+        if positions is None:
+            return True  # No positions to close
+        
+        success = True
+        for position in positions:
+            if not self.close_position(position.ticket):
+                success = False
+        
+        return success
+
+
+# ===============================================================
+# 6. FEATURE ENGINEERING
+# ===============================================================
+
+class FeatureGenerator:
+    """Generates features from tick data for signal generation"""
+    
+    def __init__(self, window_size: int = 20):
+        self.window_size = window_size
+    
+    def compute_features(self, ticks_df: pd.DataFrame) -> Dict[str, float]:
+        """Compute features from tick data"""
+        if len(ticks_df) < self.window_size:
+            # Not enough data
+            return {}
+        
+        # Use the most recent ticks
+        recent_ticks = ticks_df.iloc[-self.window_size:]
+        
+        features = {}
+        
+        # Basic features
+        features['spread'] = recent_ticks['spread'].mean()
+        features['spread_std'] = recent_ticks['spread'].std()
+        
+        # Price movement features
+        mid_prices = recent_ticks['mid']
+        features['price_velocity'] = (mid_prices.iloc[-1] - mid_prices.iloc[0]) / self.window_size
+        
+        # More advanced features
+        if len(recent_ticks) >= 3:
+            # Acceleration (second derivative of price)
+            diffs = mid_prices.diff().dropna()
+            features['price_acceleration'] = diffs.diff().dropna().mean()
+            
+            # Tick arrival rate (for detecting increased activity)
+            if 'time' in recent_ticks.columns:
+                time_diffs = recent_ticks['time'].diff().dropna()
+                features['tick_arrival_rate'] = 1000 / time_diffs.mean() if time_diffs.mean() > 0 else 0
+        
+        # Bid-ask imbalance
+        features['ba_imbalance'] = (recent_ticks['volume'] * (recent_ticks['ask'] - recent_ticks['bid'])).sum() / recent_ticks['volume'].sum()
+        
+        # Technical indicators simplified for HFT
+        features['rsi_like'] = self._fast_rsi(mid_prices)
+        
+        return features
+    
+    def _fast_rsi(self, prices: pd.Series, length: int = 14) -> float:
+        """Simplified RSI-like calculation optimized for speed"""
+        if len(prices) < length + 1:
+            return 50.0  # Neutral
+        
+        # Calculate price changes
+        changes = prices.diff().dropna()
+        
+        # Get gains and losses
+        gains = changes.copy()
+        gains[gains < 0] = 0
+        losses = -changes.copy()
+        losses[losses < 0] = 0
+        
+        # Calculate average gains and losses
+        avg_gain = gains.rolling(window=length).mean().iloc[-1]
+        avg_loss = losses.rolling(window=length).mean().iloc[-1]
+        
+        # Calculate RSI
+        if avg_loss == 0:
+            return 100.0
+        
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+        
+        return rsi
+
+
+# ===============================================================
+# 7. SIGNAL GENERATION
+# ===============================================================
+
+class SignalGenerator:
+    """Generates trading signals based on tick features"""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.feature_generator = FeatureGenerator(
+            window_size=config.getint('HFT', 'tick_features_window', 20)
+        )
+        self.signal_threshold = config.getfloat('HFT', 'signal_threshold', 0.7)
+        self.logger = logging.getLogger('HFT_Strategy.SignalGenerator')
+    
+    def generate_signal(self, tick_buffer: TickBuffer) -> Signal:
+        """Generate a trading signal from the tick buffer"""
+        ticks_df = tick_buffer.to_dataframe()
+        if len(ticks_df) < self.feature_generator.window_size:
+            return Signal(
+                symbol=tick_buffer.symbol,
+                direction=0,
+                strength=0.0,
+                timestamp=int(time.time() * 1000),
+                features={}
+            )
+        
+        # Extract features
+        features = self.feature_generator.compute_features(ticks_df)
+        if not features:
+            return Signal(
+                symbol=tick_buffer.symbol,
+                direction=0,
+                strength=0.0,
+                timestamp=int(time.time() * 1000),
+                features={}
+            )
+        
+        # Simple momentum-based signal (for demonstration)
+        signal_strength = 0.0
+        direction = 0
+        
+        # Calculate a simple signal based on price velocity and acceleration
+        if 'price_velocity' in features and 'price_acceleration' in features:
+            velocity = features['price_velocity']
+            acceleration = features['price_acceleration']
+            
+            # Normalize features
+            norm_velocity = min(max(velocity * 10000, -1), 1)  # Scale for forex pips
+            norm_acceleration = min(max(acceleration * 100000, -1), 1)  # Scale acceleration
+            
+            # Combined signal (velocity with acceleration confirmation)
+            if abs(norm_velocity) > 0.3:  # Minimal velocity threshold
+                if norm_velocity > 0 and norm_acceleration > 0:
+                    # Strong up trend
+                    direction = 1
+                    signal_strength = abs(norm_velocity) * 0.7 + abs(norm_acceleration) * 0.3
+                elif norm_velocity < 0 and norm_acceleration < 0:
+                    # Strong down trend
+                    direction = -1
+                    signal_strength = abs(norm_velocity) * 0.7 + abs(norm_acceleration) * 0.3
+        
+        # Apply RSI-like filters
+        if 'rsi_like' in features and signal_strength > 0:
+            rsi = features['rsi_like']
+            if (direction == 1 and rsi > 70) or (direction == -1 and rsi < 30):
+                # Potential reversal, reduce signal strength
+                signal_strength *= 0.5
+        
+        # Optional: Add more sophisticated logic here
+        
+        # Only return signals above threshold
+        if signal_strength < self.signal_threshold:
+            direction = 0
+            signal_strength = 0.0
+        
+        return Signal(
+            symbol=tick_buffer.symbol,
+            direction=direction,
+            strength=signal_strength,
+            timestamp=int(time.time() * 1000),
+            features=features
+        )
+
+
+# ===============================================================
+# 8. RISK MANAGEMENT
+# ===============================================================
+
+class RiskManager:
+    """Manages trading risk and enforces drawdown limits"""
+    
+    def __init__(self, config: Config, mt5_handler: MT5Handler):
+        self.config = config
+        self.mt5_handler = mt5_handler
+        self.max_drawdown = config.getfloat('Trading', 'max_drawdown', 0.2)  # 20% default
+        self.risk_per_trade = config.getfloat('Trading', 'risk_per_trade', 0.01)  # 1% default
+        self.initial_equity = 0
+        self.peak_equity = 0
+        self.current_equity = 0
+        self.drawdown = 0
+        self.active = False
+        self.logger = logging.getLogger('HFT_Strategy.RiskManager')
+    
+    def initialize(self):
+        """Initialize risk manager with current account info"""
+        account_info = self.mt5_handler.get_account_info()
+        if not account_info:
+            self.logger.error("Failed to get account info for risk initialization")
+            return False
+        
+        self.initial_equity = account_info['equity']
+        self.peak_equity = self.initial_equity
+        self.current_equity = self.initial_equity
+        self.active = True
+        self.logger.info(f"Risk manager initialized with equity: {self.initial_equity}")
+        return True
+    
+    def update(self):
+        """Update equity and drawdown calculations"""
+        if not self.active:
+            return
+        
+        account_info = self.mt5_handler.get_account_info()
+        if not account_info:
+            self.logger.warning("Failed to update equity information")
+            return
+        
+        self.current_equity = account_info['equity']
+        self.peak_equity = max(self.peak_equity, self.current_equity)
+        
+        if self.peak_equity > 0:
+            self.drawdown = 1 - (self.current_equity / self.peak_equity)
+            self.logger.info(f"Current drawdown: {self.drawdown:.2%}")
+        
+        # Check if drawdown exceeds maximum allowed
+        if self.drawdown > self.max_drawdown:
+            self.logger.warning(f"Maximum drawdown exceeded: {self.drawdown:.2%} > {self.max_drawdown:.2%}")
+            # Close all positions
+            self.mt5_handler.close_all_positions()
+    
+    def get_position_size(self, symbol: str, stop_loss_pips: float) -> float:
+        """Calculate position size based on risk per trade and stop loss"""
+        if not self.active or stop_loss_pips <= 0:
+            return 0.0
+        
+        account_info = self.mt5_handler.get_account_info()
+        if not account_info:
+            return 0.0
+        
+        # Get symbol info for converting pips to price
+        symbol_info = mt5.symbol_info(symbol)
+        if symbol_info is None:
+            return 0.0
+        
+        # Calculate pip value (for standard lot)
+        if symbol_info.trade_tick_size == 0:
+            return 0.0
+        
+        pip_value = symbol_info.trade_tick_value / symbol_info.trade_tick_size
+        if 'JPY' in symbol:
+            pip_value *= 0.01  # Adjust for JPY pairs
+        
+        # Calculate risk amount in account currency
+        risk_amount = account_info['equity'] * self.risk_per_trade
+        
+        # Adjust risk based on current drawdown
+        remaining_drawdown = self.max_drawdown - self.drawdown
+        if remaining_drawdown < 0.05:  # Less than 5% drawdown left
+            risk_amount *= 0.5  # Reduce risk by half
+        
+        # Calculate position size in lots
+        if pip_value * stop_loss_pips > 0:
+            position_size = risk_amount / (pip_value * stop_loss_pips)
+            
+            # Respect minimum and maximum position sizes
+            min_volume = symbol_info.volume_min
+            max_volume = symbol_info.volume_max
+            step = symbol_info.volume_step
+            
+            # Round to nearest volume step
+            position_size = round(position_size / step) * step
+            position_size = max(min_volume, min(position_size, max_volume))
+            
+            return position_size
+        
+        return 0.0
+    
+    def can_open_position(self, symbol: str, direction: int) -> bool:
+        """Check if opening a new position is allowed by risk management"""
+        if not self.active:
+            return False
+        
+        # Check if drawdown is below maximum
+        if self.drawdown >= self.max_drawdown:
+            self.logger.warning(f"Cannot open position: maximum drawdown reached ({self.drawdown:.2%})")
+            return False
+        
+        # Check if we're below max positions
+        max_positions = self.config.getint('Trading', 'max_positions', 5)
+        current_positions = len(self.mt5_handler.get_positions())
+        if current_positions >= max_positions:
+            self.logger.warning(f"Cannot open position: maximum positions reached ({current_positions}/{max_positions})")
+            return False
+        
+        # Check if we already have a position in the opposite direction
+        positions = self.mt5_handler.get_positions()
+        for pos in positions:
+            if pos.symbol == symbol:
+                if (direction == 1 and pos.type == mt5.ORDER_TYPE_SELL) or \
+                   (direction == -1 and pos.type == mt5.ORDER_TYPE_BUY):
+                    self.logger.warning(f"Cannot open position: opposite position exists for {symbol}")
+                    return False
+        
+        return True
+
+
+# ===============================================================
+# 9. EXECUTION ENGINE
+# ===============================================================
+
+class ExecutionEngine:
+    """Handles trade execution based on signals and risk management"""
+    
+    def __init__(self, config: Config, mt5_handler: MT5Handler, risk_manager: RiskManager):
+        self.config = config
+        self.mt5_handler = mt5_handler
+        self.risk_manager = risk_manager
+        self.logger = logging.getLogger('HFT_Strategy.ExecutionEngine')
+        self.last_trade_time = {}  # Keep track of last trade time per symbol
+        self.trade_cooldown = config.getint('HFT', 'trade_cooldown_ms', 500)  # Minimum time between trades
+    
+    def process_signal(self, signal: Signal) -> bool:
+        """Process a trading signal and execute if appropriate"""
+        if signal.direction == 0 or signal.strength == 0:
+            return False
+        
+        # Check trade cooldown
+        current_time = int(time.time() * 1000)
+        if signal.symbol in self.last_trade_time:
+            time_since_last_trade = current_time - self.last_trade_time[signal.symbol]
+            if time_since_last_trade < self.trade_cooldown:
+                return False
+        
+        # Check risk management
+        if not self.risk_manager.can_open_position(signal.symbol, signal.direction):
+            return False
+        
+        # Determine order type
+        order_type = mt5.ORDER_TYPE_BUY if signal.direction == 1 else mt5.ORDER_TYPE_SELL
+        
+        # Calculate stop loss and take profit levels
+        stop_loss_pips = self.config.getfloat('Trading', 'stop_loss_pips', 10)
+        take_profit_pips = self.config.getfloat('Trading', 'take_profit_pips', 20)
+        
+        # Get current price
+        tick = self.mt5_handler.get_tick(signal.symbol)
+        if tick is None:
+            self.logger.error(f"Failed to get current price for {signal.symbol}")
+            return False
+        
+        # Convert pips to price for stop loss and take profit
+        symbol_info = mt5.symbol_info(signal.symbol)
+        if symbol_info is None:
+            self.logger.error(f"Failed to get symbol info for {signal.symbol}")
+            return False
+        
+        # Calculate point value
+        point = symbol_info.point
+        
+        # Calculate stop loss and take profit prices
+        if order_type == mt5.ORDER_TYPE_BUY:
+            entry_price = tick.ask
+            stop_loss = entry_price - (stop_loss_pips * 10 * point)
+            take_profit = entry_price + (take_profit_pips * 10 * point)
+        else:
+            entry_price = tick.bid
+            stop_loss = entry_price + (stop_loss_pips * 10 * point)
+            take_profit = entry_price - (take_profit_pips * 10 * point)
+        
+        # Calculate position size
+        position_size = self.risk_manager.get_position_size(signal.symbol, stop_loss_pips)
+        if position_size <= 0:
+            self.logger.warning(f"Invalid position size calculated for {signal.symbol}: {position_size}")
+            return False
+        
+        # Execute trade
+        trade_comment = f"HFT Signal: {signal.strength:.2f}"
+        order_ticket = self.mt5_handler.place_market_order(
+            symbol=signal.symbol,
+            order_type=order_type,
+            volume=position_size,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            comment=trade_comment
+        )
+        
+        if order_ticket is None:
+            self.logger.error(f"Failed to execute order for {signal.symbol}")
+            return False
+        
+        # Update last trade time
+        self.last_trade_time[signal.symbol] = current_time
+        
+        self.logger.info(f"Executed {signal.symbol} {'BUY' if order_type == mt5.ORDER_TYPE_BUY else 'SELL'} "
+                        f"order: volume={position_size}, price={entry_price}, "
+                        f"sl={stop_loss}, tp={take_profit}, signal
+
+                        #continue from here

@@ -1,0 +1,23 @@
+[MT5]
+# Leave path empty to auto-detect MT5 installation
+# Or specify full path to terminal64.exe if auto-detection fails
+path = 
+username = YOUR_MT5_USERNAME
+password = YOUR_MT5_PASSWORD
+server = YOUR_MT5_SERVER
+
+[Trading]
+symbols = EURUSD,USDJPY,GBPUSD,BTCUSD
+max_positions = 5
+max_drawdown = 0.2
+risk_per_trade = 0.01
+use_market_orders = True
+stop_loss_pips = 10
+take_profit_pips = 20
+
+[HFT]
+tick_buffer_size = 1000
+signal_threshold = 0.7
+tick_features_window = 20
+polling_interval_ms = 50
+trade_cooldown_ms = 500 

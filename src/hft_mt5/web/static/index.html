@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HFT Strategy Dashboard</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js/dist/chart.umd.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+    <style>
+        :root {
+            --bg-color: #ffffff;
+            --text-color: #212529;
+            --card-bg: #ffffff;
+            --card-border: rgba(0,0,0,.125);
+            --hover-bg: #f8f9fa;
+            --chart-grid: #ddd;
+        }
+
+        [data-theme="dark"] {
+            --bg-color: #1a1a1a;
+            --text-color: #e0e0e0;
+            --card-bg: #2d2d2d;
+            --card-border: #404040;
+            --hover-bg: #363636;
+            --chart-grid: #404040;
+        }
+
+        body {
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            transition: background-color 0.3s ease;
+        }
+
+        .card {
+            margin-bottom: 1rem;
+            background-color: var(--card-bg);
+            border-color: var(--card-border);
+        }
+
+        .card-header {
+            background-color: var(--card-bg);
+            border-bottom-color: var(--card-border);
+        }
+
+        .position-card:hover {
+            background-color: var(--hover-bg);
+        }
+
+        .profit { color: #00c853; }
+        .loss { color: #ff5252; }
+        .position-card { font-size: 0.9rem; }
+        #equity-chart { height: 300px; }
+        
+        .theme-switch {
+            position: fixed;
+            top: 1rem;
+            right: 1rem;
+            z-index: 1000;
+        }
+
+        .status-indicator {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            margin-right: 5px;
+        }
+
+        .status-active {
+            background-color: #00c853;
+            box-shadow: 0 0 5px #00c853;
+            animation: pulse 2s infinite;
+        }
+
+        .status-inactive {
+            background-color: #ff5252;
+        }
+
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
+
+        .activity-log {
+            max-height: 200px;
+            overflow-y: auto;
+            font-family: monospace;
+            font-size: 0.85rem;
+        }
+
+        .log-entry {
+            padding: 4px 8px;
+            border-bottom: 1px solid var(--card-border);
+            transition: background-color 0.2s ease;
+        }
+
+        .log-entry:hover {
+            background-color: var(--hover-bg);
+        }
+
+        .log-entry:last-child {
+            border-bottom: none;
+        }
+
+        .log-timestamp {
+            color: var(--text-muted);
+            font-size: 0.8rem;
+        }
+
+        .log-action {
+            margin-left: 8px;
+        }
+
+        .log-symbol {
+            font-weight: bold;
+        }
+
+        .value-change-up { color: #00c853; }
+        .value-change-down { color: #ff5252; }
+
+        .trading-pair-card {
+            transition: all 0.3s ease;
+        }
+
+        .trading-pair-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+
+        .remove-pair {
+            opacity: 0;
+            transition: opacity 0.2s ease;
+        }
+
+        .trading-pair-card:hover .remove-pair {
+            opacity: 1;
+        }
+    </style>
+</head>
+<body>
+    <div class="theme-switch">
+        <button class="btn btn-outline-secondary" id="theme-toggle">
+            <svg id="theme-icon" width="20" height="20" fill="currentColor" class="bi" viewBox="0 0 16 16">
+                <!-- Sun icon -->
+                <path class="sun-icon" d="M8 11a3 3 0 1 1 0-6 3 3 0 0 1 0 6zm0 1a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM8 0a.5.5 0 0 1 .5.5v2a.5.5 0 0 1-1 0v-2A.5.5 0 0 1 8 0zm0 13a.5.5 0 0 1 .5.5v2a.5.5 0 0 1-1 0v-2A.5.5 0 0 1 8 13zm8-5a.5.5 0 0 1-.5.5h-2a.5.5 0 0 1 0-1h2a.5.5 0 0 1 .5.5zM3 8a.5.5 0 0 1-.5.5h-2a.5.5 0 0 1 0-1h2A.5.5 0 0 1 3 8zm10.657-5.657a.5.5 0 0 1 0 .707l-1.414 1.415a.5.5 0 1 1-.707-.708l1.414-1.414a.5.5 0 0 1 .707 0zm-9.193 9.193a.5.5 0 0 1 0 .707L3.05 13.657a.5.5 0 0 1-.707-.707l1.414-1.414a.5.5 0 0 1 .707 0zm9.193 2.121a.5.5 0 0 1-.707 0l-1.414-1.414a.5.5 0 0 1 .707-.707l1.414 1.414a.5.5 0 0 1 0 .707zM4.464 4.465a.5.5 0 0 1-.707 0L2.343 3.05a.5.5 0 1 1 .707-.707l1.414 1.414a.5.5 0 0 1 0 .708z"/>
+                <!-- Moon icon -->
+                <path class="moon-icon" d="M6 .278a.768.768 0 0 1 .08.858 7.208 7.208 0 0 0-.878 3.46c0 4.021 3.278 7.277 7.318 7.277.527 0 1.04-.055 1.533-.16a.787.787 0 0 1 .81.316.733.733 0 0 1-.031.893A8.349 8.349 0 0 1 8.344 16C3.734 16 0 12.286 0 7.71 0 4.266 2.114 1.312 5.124.06A.752.752 0 0 1 6 .278z"/>
+            </svg>
+        </button>
+    </div>
+
+    <div class="container mt-4">
+        <div class="d-flex justify-content-between align-items-center mb-4">
+            <h1>HFT Strategy Dashboard</h1>
+            <div class="d-flex align-items-center">
+                <div class="status-indicator" id="bot-status"></div>
+                <span id="bot-status-text">Checking status...</span>
+            </div>
+        </div>
+        
+        <!-- Account Summary -->
+        <div class="card">
+            <div class="card-header">
+                <h5 class="card-title mb-0">Account Summary</h5>
+            </div>
+            <div class="card-body">
+                <div class="row">
+                    <div class="col-md-3">
+                        <h6>Balance</h6>
+                        <p id="balance" class="h4">-</p>
+                    </div>
+                    <div class="col-md-3">
+                        <h6>Equity</h6>
+                        <p id="equity" class="h4">-</p>
+                    </div>
+                    <div class="col-md-3">
+                        <h6>Margin</h6>
+                        <p id="margin" class="h4">-</p>
+                    </div>
+                    <div class="col-md-3">
+                        <h6>Profit</h6>
+                        <p id="profit" class="h4">-</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Equity Curve -->
+        <div class="card">
+            <div class="card-header">
+                <h5 class="card-title mb-0">Equity Curve</h5>
+            </div>
+            <div class="card-body">
+                <canvas id="equity-chart"></canvas>
+            </div>
+        </div>
+
+        <!-- Trading Pairs -->
+        <div class="card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <h5 class="card-title mb-0">Trading Pairs</h5>
+                <button class="btn btn-sm btn-primary" data-bs-toggle="modal" data-bs-target="#addPairModal">
+                    Add Pair
+                </button>
+            </div>
+            <div class="card-body">
+                <div id="trading-pairs" class="row g-2">
+                    <!-- Trading pairs will be inserted here -->
+                </div>
+            </div>
+        </div>
+
+        <!-- Trading Activity -->
+        <div class="card">
+            <div class="card-header">
+                <h5 class="card-title mb-0">Trading Activity</h5>
+            </div>
+            <div class="card-body">
+                <div class="activity-log" id="activity-log">
+                    <!-- Activity logs will be inserted here -->
+                </div>
+            </div>
+        </div>
+        
+        <!-- Open Positions -->
+        <div class="card">
+            <div class="card-header">
+                <h5 class="card-title mb-0">Open Positions</h5>
+            </div>
+            <div class="card-body">
+                <div id="positions-container">
+                    <!-- Positions will be inserted here -->
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Add Trading Pair Modal -->
+    <div class="modal fade" id="addPairModal" tabindex="-1">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">Add Trading Pair</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <div class="mb-3">
+                        <label for="pairSymbol" class="form-label">Symbol</label>
+                        <input type="text" class="form-control" id="pairSymbol" placeholder="e.g. EURUSD">
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="button" class="btn btn-primary" id="addPairBtn">Add</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        // Register the time scale
+        Chart.register(Chart.TimeScale);
+        
+        // Initialize equity chart first
+        const ctx = document.getElementById('equity-chart').getContext('2d');
+        const equityChart = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: [],
+                datasets: [{
+                    label: 'Equity',
+                    data: [],
+                    borderColor: 'rgb(75, 192, 192)',
+                    tension: 0.1
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: {
+                    x: {
+                        type: 'time',
+                        time: {
+                            unit: 'minute',
+                            displayFormats: {
+                                minute: 'HH:mm:ss'
+                            }
+                        },
+                        grid: {
+                            color: getComputedStyle(document.documentElement).getPropertyValue('--chart-grid')
+                        }
+                    },
+                    y: {
+                        beginAtZero: false,
+                        grid: {
+                            color: getComputedStyle(document.documentElement).getPropertyValue('--chart-grid')
+                        }
+                    }
+                },
+                plugins: {
+                    legend: {
+                        labels: {
+                            color: getComputedStyle(document.documentElement).getPropertyValue('--text-color')
+                        }
+                    }
+                }
+            }
+        });
+
+        // Theme handling functions
+        function updateChartTheme(isDark) {
+            equityChart.options.scales.x.grid.color = isDark ? '#404040' : '#ddd';
+            equityChart.options.scales.y.grid.color = isDark ? '#404040' : '#ddd';
+            equityChart.options.plugins.legend.labels.color = isDark ? '#e0e0e0' : '#212529';
+            equityChart.update();
+        }
+
+        function setTheme(isDark) {
+            document.documentElement.setAttribute('data-theme', isDark ? 'dark' : 'light');
+            localStorage.setItem('theme', isDark ? 'dark' : 'light');
+            sunIcon.style.display = isDark ? 'none' : 'block';
+            moonIcon.style.display = isDark ? 'block' : 'none';
+            updateChartTheme(isDark);
+        }
+
+        // Theme toggle setup
+        const themeToggle = document.getElementById('theme-toggle');
+        const sunIcon = document.querySelector('.sun-icon');
+        const moonIcon = document.querySelector('.moon-icon');
+
+        // Initialize theme
+        const savedTheme = localStorage.getItem('theme') || 'light';
+        setTheme(savedTheme === 'dark');
+
+        themeToggle.addEventListener('click', () => {
+            const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+            setTheme(!isDark);
+        });
+
+        // WebSocket connection
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+        let reconnectAttempts = 0;
+        const maxReconnectAttempts = 5;
+        const reconnectDelay = 1000;  // 1 second
+
+        function connect() {
+            ws.onopen = () => {
+                console.log('Connected to server');
+                reconnectAttempts = 0;
+            };
+
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                updateDashboard(data);
+            };
+
+            ws.onclose = () => {
+                console.log('Disconnected from server');
+                if (reconnectAttempts < maxReconnectAttempts) {
+                    setTimeout(() => {
+                        reconnectAttempts++;
+                        connect();
+                    }, reconnectDelay);
+                }
+            };
+
+            ws.onerror = (error) => {
+                console.error('WebSocket error:', error);
+            };
+        }
+
+        function updateDashboard(data) {
+            // Update account info
+            if (data.account) {
+                document.getElementById('balance').textContent = `$${data.account.balance.toFixed(2)}`;
+                document.getElementById('equity').textContent = `$${data.account.equity.toFixed(2)}`;
+                document.getElementById('margin').textContent = `$${data.account.margin.toFixed(2)}`;
+                
+                const profit = data.account.profit;
+                const profitElement = document.getElementById('profit');
+                profitElement.textContent = `$${profit.toFixed(2)}`;
+                profitElement.className = profit >= 0 ? 'h4 profit' : 'h4 loss';
+                
+                // Update equity chart
+                const timestamp = new Date();
+                equityChart.data.labels.push(timestamp);
+                equityChart.data.datasets[0].data.push(data.account.equity);
+                
+                // Keep only last 100 points
+                if (equityChart.data.labels.length > 100) {
+                    equityChart.data.labels.shift();
+                    equityChart.data.datasets[0].data.shift();
+                }
+                equityChart.update();
+            }
+            
+            // Update trading pairs
+            if (data.symbols) {
+                const pairsContainer = document.getElementById('trading-pairs');
+                pairsContainer.innerHTML = '';
+                
+                data.symbols.forEach(symbol => {
+                    const pairCard = document.createElement('div');
+                    pairCard.className = 'col-md-3 mb-3';
+                    pairCard.innerHTML = `
+                        <div class="card h-100 trading-pair-card">
+                            <div class="card-body d-flex justify-content-between align-items-center">
+                                <div>
+                                    <h6 class="mb-0">${symbol}</h6>
+                                    <small class="text-muted">Active</small>
+                                </div>
+                                <button class="btn btn-sm btn-outline-danger remove-pair" data-symbol="${symbol}">
+                                    <i class="bi bi-x"></i>
+                                </button>
+                            </div>
+                        </div>
+                    `;
+                    pairsContainer.appendChild(pairCard);
+                });
+                
+                // Add event listeners for remove buttons
+                document.querySelectorAll('.remove-pair').forEach(button => {
+                    button.addEventListener('click', () => {
+                        const symbol = button.dataset.symbol;
+                        if (confirm(`Are you sure you want to remove ${symbol}?`)) {
+                            ws.send(JSON.stringify({
+                                action: 'remove_symbol',
+                                symbol: symbol
+                            }));
+                        }
+                    });
+                });
+            }
+            
+            // Update trading activity
+            if (data.activity) {
+                const log = document.getElementById('activity-log');
+                data.activity.forEach(activity => {
+                    const entry = document.createElement('div');
+                    entry.className = 'log-entry';
+                    entry.innerHTML = `
+                        <span class="log-timestamp">${new Date(activity.timestamp * 1000).toLocaleTimeString()}</span>
+                        <span class="log-action ${activity.type === 'open' ? 'text-success' : activity.type === 'close' ? 'text-danger' : ''}">${activity.action}</span>
+                        <span class="log-symbol">${activity.symbol}</span>
+                        ${activity.price ? `@ ${activity.price}` : ''}
+                    `;
+                    log.insertBefore(entry, log.firstChild);
+                });
+                
+                // Keep only last 50 entries
+                while (log.children.length > 50) {
+                    log.removeChild(log.lastChild);
+                }
+            }
+            
+            // Update positions
+            if (data.positions) {
+                const container = document.getElementById('positions-container');
+                container.innerHTML = '';
+                
+                data.positions.forEach(position => {
+                    const card = document.createElement('div');
+                    card.className = 'card position-card mb-2';
+                    card.innerHTML = `
+                        <div class="card-body">
+                            <div class="d-flex justify-content-between align-items-center">
+                                <div>
+                                    <h6>${position.symbol}</h6>
+                                    <small>${position.type} ${position.volume} lots @ ${position.open_price}</small>
+                                </div>
+                                <div class="text-end">
+                                    <div class="${position.profit >= 0 ? 'profit' : 'loss'}">
+                                        $${position.profit.toFixed(2)}
+                                    </div>
+                                    <small>Current: ${position.current_price}</small>
+                                </div>
+                            </div>
+                        </div>
+                    `;
+                    container.appendChild(card);
+                });
+                
+                if (data.positions.length === 0) {
+                    container.innerHTML = '<p class="text-muted">No open positions</p>';
+                }
+            }
+            
+            // Update bot status
+            if (data.status) {
+                const statusIndicator = document.getElementById('bot-status');
+                const statusText = document.getElementById('bot-status-text');
+                
+                if (data.status.connected && data.status.running) {
+                    statusIndicator.className = 'status-indicator status-active';
+                    statusText.textContent = 'Bot Active';
+                } else {
+                    statusIndicator.className = 'status-indicator status-inactive';
+                    statusText.textContent = 'Bot Inactive';
+                }
+            }
+        }
+
+        // Start WebSocket connection
+        connect();
+
+        // Add pair button handler
+        document.getElementById('addPairBtn').addEventListener('click', () => {
+            const symbol = document.getElementById('pairSymbol').value.trim().toUpperCase();
+            if (symbol) {
+                ws.send(JSON.stringify({
+                    action: 'add_symbol',
+                    symbol: symbol
+                }));
+                document.getElementById('pairSymbol').value = '';
+                bootstrap.Modal.getInstance(document.getElementById('addPairModal')).hide();
+            }
+        });
+    </script>
+</body>
+</html> 
