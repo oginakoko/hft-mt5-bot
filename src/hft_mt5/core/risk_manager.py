@@ -86,8 +86,17 @@ class RiskManager:
                 self.logger.warning(f"Max drawdown reached: {drawdown:.2%}")
                 return False
                 
-            # Check margin level
-            if account_info['margin_level'] < 200:  # Minimum 200% margin level
+            # Check margin safety using free margin instead of margin level
+            margin = account_info.get('margin', 0)
+            free_margin = account_info.get('free_margin', 0)
+            
+            if margin > 0:
+                margin_safety_ratio = free_margin / margin
+                if margin_safety_ratio < 2:  # Equivalent to 200% margin level
+                    self.logger.warning(f"Insufficient margin safety: {margin_safety_ratio:.2f}")
+                    return False
+            elif free_margin <= 0:
+                self.logger.warning("No free margin available")
                 return False
                 
             # Calculate total risk
@@ -119,9 +128,30 @@ class RiskManager:
             equity = account_info['equity']
             risk_amount = equity * self.max_risk_per_trade * signal_strength
             
-            # Calculate position size in lots
-            point_value = symbol_info['point'] * symbol_info['trade_tick_value']
+            # Calculate point value with fallbacks
+            point = symbol_info.get('point', None)
+            if point is None:
+                # Standard point values for major pairs
+                if symbol in ['EURUSD', 'GBPUSD', 'AUDUSD', 'NZDUSD']:
+                    point = 0.0001
+                elif symbol in ['USDJPY']:
+                    point = 0.01
+                else:
+                    point = 0.0001  # Default fallback
+                self.logger.warning(f"Using fallback point value {point} for {symbol}")
+            
+            tick_value = symbol_info.get('trade_tick_value', None)
+            if tick_value is None:
+                # Approximate tick value based on point
+                if 'JPY' in symbol:
+                    tick_value = point * 100  # JPY pairs have different multiplier
+                else:
+                    tick_value = point * 10
+                self.logger.warning(f"Using fallback tick value {tick_value} for {symbol}")
+            
+            point_value = point * tick_value
             if point_value == 0:
+                self.logger.error(f"Invalid point value for {symbol}")
                 return 0.0
                 
             # Dynamic stop loss based on volatility
@@ -131,15 +161,15 @@ class RiskManager:
             # Calculate maximum position size
             max_position_size = risk_amount / (stop_loss_points * point_value)
             
-            # Apply limits
-            min_lot = symbol_info['volume_min']
-            max_lot = min(symbol_info['volume_max'], max_position_size)
+            # Apply limits with fallbacks
+            min_lot = symbol_info.get('volume_min', 0.01)  # Standard min lot
+            max_lot = min(symbol_info.get('volume_max', 100.0), max_position_size)  # Standard max lot
             
             # Scale position size by signal strength
             position_size = min_lot + (max_lot - min_lot) * signal_strength
             
-            # Round to symbol lot step
-            lot_step = symbol_info['volume_step']
+            # Round to standard lot step if not provided
+            lot_step = symbol_info.get('volume_step', 0.01)  # Standard lot step
             position_size = round(position_size / lot_step) * lot_step
             
             return max(min_lot, min(position_size, max_lot))

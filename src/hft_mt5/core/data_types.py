@@ -70,11 +70,14 @@ class Signal:
     timestamp: float = 0.0  # Signal generation timestamp
 
 class TickBuffer:
-    """Circular buffer for storing recent ticks."""
+    """Buffer to store recent ticks for a symbol."""
     
     def __init__(self, max_size: int = 1000):
-        """Initialize buffer with numpy array for better performance."""
+        """Initialize tick buffer with both numpy array and object storage."""
         self.max_size = max_size
+        self.ticks = []  # Store Tick objects for virtual SL/TP
+        
+        # Numpy array for feature generation
         self.buffer = np.zeros(max_size, dtype=[
             ('time', 'f8'),
             ('bid', 'f8'),
@@ -88,7 +91,13 @@ class TickBuffer:
         self.lock = threading.Lock()
         
     def add_tick(self, tick: Tick):
-        """Add new tick to buffer."""
+        """Add a new tick to both storage formats."""
+        # Add to Tick objects list
+        self.ticks.append(tick)
+        if len(self.ticks) > self.max_size:
+            self.ticks.pop(0)
+            
+        # Add to numpy array
         with self.lock:
             self.buffer[self.current_idx]['time'] = tick.time
             self.buffer[self.current_idx]['bid'] = tick.bid
@@ -100,9 +109,13 @@ class TickBuffer:
             self.current_idx = (self.current_idx + 1) % self.max_size
             if self.current_idx == 0:
                 self.is_filled = True
+                
+    def get_ticks(self) -> List[Tick]:
+        """Get all ticks as Tick objects for virtual SL/TP."""
+        return self.ticks
         
     def get_recent(self, n: int = None) -> np.ndarray:
-        """Get n most recent ticks."""
+        """Get n most recent ticks as numpy array for feature generation."""
         with self.lock:
             if n is None:
                 n = self.max_size
@@ -118,19 +131,24 @@ class TickBuffer:
                         return np.concatenate((self.buffer[idx:], self.buffer[:self.current_idx]))
             else:
                 return self.buffer[:self.current_idx].copy()
+                
+    def clear(self):
+        """Clear all ticks from both storage formats."""
+        self.ticks.clear()
+        self.buffer.fill(0)
+        self.current_idx = 0
+        self.is_filled = False
+        
+    def get_latest_tick(self) -> Optional[Tick]:
+        """Get the most recent tick."""
+        if not self.ticks:
+            return None
+        return self.ticks[-1]
         
     def to_dataframe(self, n_ticks: Optional[int] = None) -> pd.DataFrame:
-        """Convert tick buffer to pandas DataFrame.
-        
-        Args:
-            n_ticks: Optional number of most recent ticks to include. If None, includes all ticks.
-            
-        Returns:
-            pd.DataFrame: DataFrame with columns [time, bid, ask, volume, spread, mid_price]
-        """
+        """Convert tick buffer to pandas DataFrame."""
         ticks = self.get_recent(n_ticks)
         if len(ticks) == 0:
             return pd.DataFrame(columns=['time', 'bid', 'ask', 'volume', 'spread', 'mid_price'])
             
-        # Create DataFrame without setting time as index
         return pd.DataFrame(ticks)
