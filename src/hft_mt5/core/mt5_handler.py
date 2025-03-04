@@ -1,10 +1,16 @@
 """MetaTrader 5 connection handler."""
 
-import MetaTrader5 as mt5
+try:
+    import MetaTrader5 as mt5
+except ImportError:
+    raise ImportError("MetaTrader5 package is not installed. Please install it with: pip install MetaTrader5")
+
 import logging
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 from datetime import datetime
 import time
+import os
+import psutil
 from .config import Config
 
 class MT5Handler:
@@ -15,24 +21,23 @@ class MT5Handler:
         self.logger = logging.getLogger('HFT_Strategy.MT5Handler')
         self.connected = False
         
-    def verify_installation(self) -> bool:
-        """Verify MT5 installation and version."""
-        self.logger.info("Verifying MT5 Installation")
-        if not mt5.initialize():
-            self.logger.error(f"MetaTrader5 package initialization failed: {mt5.last_error()}")
-            return False
-            
-        terminal_info = mt5.terminal_info()
-        if terminal_info is None:
-            self.logger.error("Failed to get terminal info")
-            return False
+        # Verify MT5 package is properly installed
+        if not hasattr(mt5, "__version__"):
+            self.logger.error("MetaTrader5 package is not properly installed")
+            raise RuntimeError("MetaTrader5 package is not properly installed")
             
         self.logger.info(f"MetaTrader5 package version: {mt5.__version__}")
-        self.logger.info(f"Terminal info:")
-        self.logger.info(f"  Company: {terminal_info.company}")
-        self.logger.info(f"  Terminal: {terminal_info.name}")
-        self.logger.info(f"  Connected: {terminal_info.connected}")
-        return True
+        
+    def _find_mt5_instances(self) -> List[Tuple[str, str]]:
+        """Find all running MT5 instances and their paths."""
+        mt5_instances = []
+        for proc in psutil.process_iter(['name', 'exe']):
+            try:
+                if proc.info['name'].lower() in ['terminal64.exe', 'terminal.exe']:
+                    mt5_instances.append((proc.info['exe'], proc.info['name']))
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+        return mt5_instances
         
     def connect(self) -> bool:
         """Initialize connection to MT5 terminal."""
@@ -41,90 +46,178 @@ class MT5Handler:
             
         # First shutdown any existing connections
         mt5.shutdown()
+        time.sleep(1)  # Give MT5 time to clean up
         
         self.logger.info("\n=== Connecting to MT5 ===")
         
-        # Get MT5 path from config
-        mt5_path = self.config.get('MT5', 'path')
-        self.logger.info(f"Using MT5 path: {mt5_path}")
+        # Find all running MT5 instances
+        mt5_instances = self._find_mt5_instances()
         
-        # Initialize MT5
-        self.logger.info("Initializing MT5...")
-        if not mt5.initialize(path=mt5_path):
-            error = mt5.last_error()
-            self.logger.error(f"Initialize failed. Error code: {error[0]}, Message: {error[1]}")
+        if not mt5_instances:
+            self.logger.error("No running MT5 instances found")
             return False
             
-        # Get terminal info
-        self.logger.info("Getting terminal info...")
-        terminal_info = mt5.terminal_info()
-        if terminal_info is not None:
-            self.logger.info(f"MetaTrader5 version: {mt5.__version__}")
-            self.logger.info(f"Terminal info:")
-            self.logger.info(f"  Company: {terminal_info.company}")
-            self.logger.info(f"  Name: {terminal_info.name}")
-            self.logger.info(f"  Connected: {terminal_info.connected}")
-            self.logger.info(f"  Path: {terminal_info.path}")
+        # If multiple instances found, ask user which one to connect to
+        selected_path = None
+        if len(mt5_instances) > 1:
+            self.logger.info("\nMultiple MT5 instances found:")
+            for i, (path, name) in enumerate(mt5_instances):
+                self.logger.info(f"{i+1}. {name} at {path}")
             
-            if not terminal_info.connected:
-                self.logger.error("Terminal is not connected to broker")
-                mt5.shutdown()
-                return False
+            # Use the first instance by default
+            selected_path = mt5_instances[0][0]
+            self.logger.info(f"\nAutomatically selecting first instance: {selected_path}")
         else:
-            self.logger.error("Failed to get terminal info")
-            return False
+            selected_path = mt5_instances[0][0]
+            self.logger.info(f"Found MT5 instance at: {selected_path}")
         
-        # Login to the account
-        username = self.config.getint('MT5', 'username')
-        password = self.config.get('MT5', 'password')
-        server = self.config.get('MT5', 'server')
+        # Initialize MT5 with timeout and retries
+        timeout_ms = self.config.getint('MT5', 'timeout_ms', fallback=5000)
+        max_init_retries = self.config.getint('MT5', 'max_retries', fallback=3)
         
-        self.logger.info(f"\nAttempting login...")
-        self.logger.info(f"Username: {username}")
-        self.logger.info(f"Server: {server}")
-        
-        # Add retry logic for login
-        max_retries = self.config.getint('MT5', 'retries', fallback=3)
-        retry_delay = self.config.getfloat('MT5', 'retry_delay', fallback=1.0)
-        
-        for attempt in range(max_retries):
-            login_result = mt5.login(
-                login=username,
-                password=password,
-                server=server
-            )
+        self.logger.info("Initializing MT5...")
+        for init_attempt in range(max_init_retries):
+            try:
+                if mt5.initialize(path=selected_path, timeout=timeout_ms):
+                    break
+                error = mt5.last_error()
+                self.logger.warning(f"Initialize attempt {init_attempt + 1} failed. Error code: {error[0]}, Message: {error[1]}")
+                if init_attempt < max_init_retries - 1:
+                    time.sleep(1)
+                    continue
+                self.logger.error("All initialize attempts failed")
+                return False
+            except Exception as e:
+                self.logger.error(f"Unexpected error during initialization: {str(e)}")
+                if init_attempt < max_init_retries - 1:
+                    time.sleep(1)
+                    continue
+                return False
             
-            if login_result:
-                break
-                
-            error = mt5.last_error()
-            self.logger.warning(f"Login attempt {attempt + 1} failed. Error code: {error[0]}, Message: {error[1]}")
-            
-            if attempt < max_retries - 1:
-                self.logger.info(f"Retrying in {retry_delay} seconds...")
-                time.sleep(retry_delay)
+        # Get terminal info with retry
+        self.logger.info("Getting terminal info...")
+        for info_attempt in range(3):
+            try:
+                terminal_info = mt5.terminal_info()
+                if terminal_info is not None:
+                    self.logger.info(f"MetaTrader5 version: {mt5.__version__}")
+                    self.logger.info(f"Terminal info:")
+                    self.logger.info(f"  Company: {terminal_info.company}")
+                    self.logger.info(f"  Name: {terminal_info.name}")
+                    self.logger.info(f"  Connected: {terminal_info.connected}")
+                    self.logger.info(f"  Path: {terminal_info.path}")
+                    
+                    if not terminal_info.connected:
+                        self.logger.error("Terminal is not connected to broker")
+                        mt5.shutdown()
+                        return False
+                    break
+                else:
+                    if info_attempt < 2:
+                        time.sleep(1)
+                        continue
+                    self.logger.error("Failed to get terminal info after 3 attempts")
+                    return False
+            except Exception as e:
+                self.logger.error(f"Error getting terminal info: {str(e)}")
+                if info_attempt < 2:
+                    time.sleep(1)
+                    continue
+                return False
         
-        if not login_result:
-            error = mt5.last_error()
-            self.logger.error(f"All login attempts failed. Error code: {error[0]}, Message: {error[1]}")
-            mt5.shutdown()
-            return False
-        
-        # Verify connection with account info
-        self.logger.info("\nGetting account info...")
+        # Try to get account info without login
+        self.logger.info("\nAttempting to get account info...")
         account_info = mt5.account_info()
+        
         if account_info is not None:
+            # Successfully connected to already logged in instance
             self.connected = True
+            self.logger.info(f"Successfully connected to logged in account:")
             self.logger.info(f"Account: {account_info.login}")
             self.logger.info(f"Name: {account_info.name}")
             self.logger.info(f"Server: {account_info.server}")
             self.logger.info(f"Balance: ${account_info.balance:.2f}")
             self.logger.info(f"Equity: ${account_info.equity:.2f}")
             return True
+            
+        # If not logged in, try to login with credentials from config
+        username = self.config.getint('MT5', 'username', fallback=None)
+        password = self.config.get('MT5', 'password', fallback=None)
+        server = self.config.get('MT5', 'server', fallback=None)
+        
+        if username and password and server:
+            self.logger.info("\nNo active login found, attempting login with credentials...")
+            self.logger.info(f"Username: {username}")
+            self.logger.info(f"Server: {server}")
+            
+            # Add retry logic for login
+            max_retries = self.config.getint('MT5', 'max_retries', fallback=3)
+            retry_delay_ms = self.config.getfloat('MT5', 'retry_delay_ms', fallback=1000)
+            retry_delay = retry_delay_ms / 1000.0
+            
+            for attempt in range(max_retries):
+                try:
+                    login_result = mt5.login(
+                        login=username,
+                        password=password,
+                        server=server.strip(),
+                        timeout=timeout_ms
+                    )
+                    
+                    if login_result:
+                        break
+                        
+                    error = mt5.last_error()
+                    self.logger.warning(f"Login attempt {attempt + 1} failed. Error code: {error[0]}, Message: {error[1]}")
+                    
+                    if attempt < max_retries - 1:
+                        self.logger.info(f"Retrying in {retry_delay:.1f} seconds...")
+                        time.sleep(retry_delay)
+                except Exception as e:
+                    self.logger.error(f"Unexpected error during login: {str(e)}")
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                        continue
+                    mt5.shutdown()
+                    return False
+            
+            if not login_result:
+                error = mt5.last_error()
+                self.logger.error(f"All login attempts failed. Error code: {error[0]}, Message: {error[1]}")
+                mt5.shutdown()
+                return False
         else:
-            self.logger.error("Failed to get account info")
+            self.logger.error("No credentials found in config and no active login found")
             mt5.shutdown()
             return False
+        
+        # Final verification with account info
+        self.logger.info("\nVerifying connection...")
+        for acc_attempt in range(3):
+            try:
+                account_info = mt5.account_info()
+                if account_info is not None:
+                    self.connected = True
+                    self.logger.info(f"Account: {account_info.login}")
+                    self.logger.info(f"Name: {account_info.name}")
+                    self.logger.info(f"Server: {account_info.server}")
+                    self.logger.info(f"Balance: ${account_info.balance:.2f}")
+                    self.logger.info(f"Equity: ${account_info.equity:.2f}")
+                    return True
+                else:
+                    if acc_attempt < 2:
+                        time.sleep(1)
+                        continue
+                    self.logger.error("Failed to get account info after 3 attempts")
+                    mt5.shutdown()
+                    return False
+            except Exception as e:
+                self.logger.error(f"Error getting account info: {str(e)}")
+                if acc_attempt < 2:
+                    time.sleep(1)
+                    continue
+                mt5.shutdown()
+                return False
     
     def disconnect(self):
         """Shutdown MT5 connection"""
@@ -287,4 +380,24 @@ class MT5Handler:
             "min_lot": symbol_info.volume_min,
             "max_lot": symbol_info.volume_max,
             "lot_step": symbol_info.volume_step
+        }
+        
+    def get_last_tick(self, symbol: str) -> Dict:
+        """Get the latest tick data for a symbol."""
+        if not self.connected:
+            return {"error": "Not connected"}
+            
+        # Get last tick from MT5
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            error = mt5.last_error()
+            return {"error": f"Failed to get tick: {error[1]}"}
+            
+        return {
+            'time': datetime.fromtimestamp(tick.time).timestamp(),
+            'bid': tick.bid,
+            'ask': tick.ask,
+            'last': tick.last,
+            'volume': tick.volume,
+            'flags': tick.flags
         } 
